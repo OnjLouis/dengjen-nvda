@@ -91,6 +91,7 @@ STARTUP_TIMEOUT = SERVER_CHECK_TIMEOUT + 5
 CALL_TIMEOUT = 10
 CHANNEL_CLOSE_TIMEOUT = 5
 PORT_HANDSHAKE_TIMEOUT = 10
+PROCESS_EXIT_TIMEOUT = 3
 
 
 _LISTENING_LINE_RE = re.compile(r"DENGJEN_GRPC_LISTENING port=(\d+)\r?\n")
@@ -128,12 +129,134 @@ def _wait_for_listening_port(process, log_path, timeout=None, poll_interval=0.05
         time.sleep(poll_interval)
 
 
+def _clear_saved_server_state():
+    for name in ("DENGJEN_GRPC_SERVER_PORT", "GRPC_SERVER_PROCESS"):
+        if hasattr(globalVars, name):
+            delattr(globalVars, name)
+
+
+def _matches_grpc_exe(proc, grpc_server_exe):
+    """Best-effort match: a process can exit or become inaccessible between
+    enumeration and inspection, so any lookup failure here just means "not
+    a match" rather than aborting the scan."""
+    try:
+        name = proc.name()
+    except Exception:
+        return False
+    if not name or "dengjen-tts-grpc" not in name.lower():
+        return False
+    try:
+        exe = proc.exe()
+    except Exception:
+        return False
+    if not exe:
+        return False
+    try:
+        return os.path.samefile(exe, grpc_server_exe)
+    except (OSError, TypeError):
+        return False
+
+
+def _owned_by_this_process(proc):
+    """DETACHED_PROCESS keeps the Windows parent-process link. An NVDA
+    in-process restart reuses the OS pid but drops this module's
+    globalVars-backed state, so a same-path helper still parented by our
+    own pid is one start_grpc_server() failed to reconnect to; one parented
+    by another still-live NVDA process (e.g. the secure desktop instance)
+    must be left alone.
+    """
+    try:
+        parent = proc.parent()
+    except Exception:
+        return False
+    return parent is not None and parent.pid == os.getpid()
+
+
+def _find_stale_grpc_helpers(psutil, grpc_server_exe):
+    return [
+        proc
+        for proc in psutil.process_iter(attrs=["name", "exe"])
+        if _matches_grpc_exe(proc, grpc_server_exe) and _owned_by_this_process(proc)
+    ]
+
+
+def _terminate_stale_grpc_helpers(psutil, processes):
+    if not processes:
+        return
+    for proc in processes:
+        try:
+            proc.terminate()
+        except Exception:
+            log.debug(
+                "Could not terminate an abandoned Dengjen GRPC helper", exc_info=True
+            )
+    _, alive = psutil.wait_procs(processes, timeout=PROCESS_EXIT_TIMEOUT)
+    removed_count = len(processes) - len(alive)
+    if removed_count:
+        log.info(f"Removed {removed_count} abandoned Dengjen GRPC helper process(es)")
+    if alive:
+        # On Windows, terminate() and kill() both call TerminateProcess. A
+        # second attempt cannot improve the result, so report and continue.
+        log.warning(
+            f"Could not remove {len(alive)} abandoned Dengjen GRPC helper process(es)"
+        )
+
+
+def _reap_stale_grpc_servers(grpc_server_exe):
+    """Recovery for a helper left running after a failed local shutdown --
+    most commonly an NVDA in-process restart, which reuses the OS pid but
+    drops this module's globalVars-backed state. Must never make the
+    synthesizer unavailable in an otherwise healthy NVDA session, so any
+    failure here -- including psutil being unavailable -- is logged and
+    swallowed rather than raised.
+    """
+    try:
+        with import_bundled_library():
+            import psutil
+    except ImportError:
+        log.debug(
+            "psutil unavailable; skipping abandoned-helper cleanup", exc_info=True
+        )
+        return
+    try:
+        stale = _find_stale_grpc_helpers(psutil, grpc_server_exe)
+        _terminate_stale_grpc_helpers(psutil, stale)
+    except Exception:
+        log.exception("Failed while checking for abandoned Dengjen GRPC helpers")
+
+
+def _saved_server_is_alive():
+    if not hasattr(globalVars, "DENGJEN_GRPC_SERVER_PORT"):
+        return False
+    saved_process = getattr(globalVars, "GRPC_SERVER_PROCESS", None)
+    try:
+        return saved_process is not None and saved_process.poll() is None
+    except OSError:
+        log.debug("Could not inspect the saved Dengjen GRPC helper", exc_info=True)
+        return False
+
+
+def _reap_if_needed(grpc_server_exe):
+    """Run off the aio loop thread by initialize(), before start_grpc_server()
+    decides whether to reuse the saved helper or spawn a replacement.
+
+    Skipped entirely when the saved helper is still alive -- there is
+    nothing stale to look for, and it avoids running the system-wide
+    psutil scan on every single call.
+    """
+    if _saved_server_is_alive():
+        return
+    _clear_saved_server_state()
+    _reap_stale_grpc_servers(grpc_server_exe)
+
+
 def start_grpc_server():
     global GRPC_SERVER_PROCESS, DENGJEN_GRPC_SERVER_PORT, SERVER_LOG_HANDLE
-    if hasattr(globalVars, "DENGJEN_GRPC_SERVER_PORT"):
+    if _saved_server_is_alive():
         DENGJEN_GRPC_SERVER_PORT = globalVars.DENGJEN_GRPC_SERVER_PORT
         GRPC_SERVER_PROCESS = globalVars.GRPC_SERVER_PROCESS
         return True
+    _clear_saved_server_state()
     if _vcruntime_missing():
         log.error(
             "Dengjen GRPC server cannot start: vcruntime140_1.dll not found. "
@@ -214,6 +337,8 @@ def start_grpc_server():
 @aio.asyncio_coroutine_to_concurrent_future
 async def initialize():
     global CHANNEL, DENGJEN_GRPC_SERVICE
+    grpc_server_exe = os.path.join(BIN_DIRECTORY, "dengjen-tts-grpc.exe")
+    await aio.run_in_executor(_reap_if_needed, grpc_server_exe)
     if not start_grpc_server():
         raise RuntimeError("Failed to start the Dengjen GRPC server")
     if CHANNEL is not None:
@@ -266,10 +391,15 @@ def terminate():
     try:
         close_channel()
         aio.terminate()
-        if GRPC_SERVER_PROCESS is not None:
+        if GRPC_SERVER_PROCESS is not None and GRPC_SERVER_PROCESS.poll() is None:
             GRPC_SERVER_PROCESS.terminate()
+            try:
+                GRPC_SERVER_PROCESS.wait(timeout=PROCESS_EXIT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                log.warning("Dengjen GRPC helper did not exit during shutdown")
     finally:
         GRPC_SERVER_PROCESS = None
+        _clear_saved_server_state()
         if SERVER_LOG_HANDLE is not None:
             SERVER_LOG_HANDLE.close()
             SERVER_LOG_HANDLE = None
