@@ -110,12 +110,19 @@ def clean_slate():
     this test's reap path emits. dengjen_grpc.log is a name already bound
     at import time, so replacing it here (rather than the sys.modules
     entry) reaches this module's logging specifically, print()ing so
-    pytest surfaces it in the failure's captured output.
+    pytest surfaces it in the failure's captured output. Restored
+    afterward -- it's the same shared module other contract files in this
+    session import too, and would otherwise leak this file's diagnostic
+    printing into their tests.
     """
+    original_log = dengjen_grpc.log
     dengjen_grpc.log = _printing_log("dengjen_grpc")
-    dengjen_grpc.terminate()
-    yield
-    dengjen_grpc.terminate()
+    try:
+        dengjen_grpc.terminate()
+        yield
+    finally:
+        dengjen_grpc.terminate()
+        dengjen_grpc.log = original_log
 
 
 class TestOrphanedHelperReaping:

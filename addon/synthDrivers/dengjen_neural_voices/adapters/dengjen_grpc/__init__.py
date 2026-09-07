@@ -401,8 +401,14 @@ def terminate():
     global GRPC_SERVER_PROCESS, DENGJEN_GRPC_SERVER_PORT, SERVER_LOG_HANDLE
     DENGJEN_GRPC_SERVER_PORT = None
     try:
-        close_channel()
-        aio.terminate()
+        # Isolated from the process-kill below: a failure here must not skip
+        # it and leave the helper running with its state already cleared --
+        # the exact abandoned-helper condition this module reaps for.
+        try:
+            close_channel()
+            aio.terminate()
+        except Exception:
+            log.debug("Failed to tear down the GRPC channel or aio loop", exc_info=True)
         if GRPC_SERVER_PROCESS is not None and GRPC_SERVER_PROCESS.poll() is None:
             GRPC_SERVER_PROCESS.terminate()
             try:
