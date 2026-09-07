@@ -83,6 +83,7 @@ DENGJEN_GRPC_SERVER_PORT = None
 GRPC_SERVER_PROCESS = None
 SERVER_LOG_HANDLE = None
 CHANNEL = None
+CHANNEL_PORT = None
 DENGJEN_GRPC_SERVICE = None
 SERVER_CHECK_TIMEOUT = 15
 
@@ -336,17 +337,22 @@ def start_grpc_server():
 
 @aio.asyncio_coroutine_to_concurrent_future
 async def initialize():
-    global CHANNEL, DENGJEN_GRPC_SERVICE
+    global CHANNEL, CHANNEL_PORT, DENGJEN_GRPC_SERVICE
     grpc_server_exe = os.path.join(BIN_DIRECTORY, "dengjen-tts-grpc.exe")
     await aio.run_in_executor(_reap_if_needed, grpc_server_exe)
     if not start_grpc_server():
         raise RuntimeError("Failed to start the Dengjen GRPC server")
+    port = DENGJEN_GRPC_SERVER_PORT
     if CHANNEL is not None:
         try:
+            # grpc.aio binds a channel to the loop that created it, so a channel
+            # outliving its loop has to be replaced rather than reused. A new
+            # helper also receives a new port, which invalidates the old channel.
             channel_loop = getattr(CHANNEL, "_loop", None)
             if (
                 channel_loop is aio.ENGINE.event_loop
                 and aio.ENGINE.event_loop.is_running()
+                and CHANNEL_PORT == port
             ):
                 return
         except Exception:
@@ -356,8 +362,10 @@ async def initialize():
         except Exception:
             log.debug("Failed to close the stale GRPC channel", exc_info=True)
         CHANNEL = None
-    port = DENGJEN_GRPC_SERVER_PORT
+        CHANNEL_PORT = None
+        DENGJEN_GRPC_SERVICE = None
     CHANNEL = grpc.aio.insecure_channel(f"localhost:{port}")
+    CHANNEL_PORT = port
     DENGJEN_GRPC_SERVICE = DengjenGrpcStub(CHANNEL)
 
 
@@ -367,10 +375,14 @@ def close_channel():
     Channel.close() is a coroutine whose internals walk the running loop's
     task set, so it cannot be driven from another thread or a stopped loop.
     """
-    global CHANNEL
+    global CHANNEL, CHANNEL_PORT, DENGJEN_GRPC_SERVICE
     if CHANNEL is None:
+        CHANNEL_PORT = None
+        DENGJEN_GRPC_SERVICE = None
         return
     channel, CHANNEL = CHANNEL, None
+    CHANNEL_PORT = None
+    DENGJEN_GRPC_SERVICE = None
     loop = aio.ENGINE.event_loop
     if loop is None or not loop.is_running():
         log.debug("Discarding the GRPC channel: its event loop is gone")
@@ -415,11 +427,11 @@ async def _clear_stale_server_state():
     that same now-dead process and port forever, since its cache check
     only looks at presence, not health.
 
-    Also clears CHANNEL/DENGJEN_GRPC_SERVICE: initialize() reuses a cached
-    CHANNEL outright when its loop still matches the running one, without
-    checking which port it was opened against -- leaving those set would
-    have every later RPC call reconnect to the dead port's channel even
-    after a fresh subprocess starts on a new one.
+    Also clears CHANNEL/CHANNEL_PORT/DENGJEN_GRPC_SERVICE: initialize()
+    reuses a cached CHANNEL outright when its loop and CHANNEL_PORT both
+    still match -- leaving those set would have every later RPC call
+    reconnect to the dead port's channel even after a fresh subprocess
+    starts on a new one.
 
     Called from check_grpc_server() -- the one place that actually
     confirms the server is alive -- whenever that confirmation fails, so
@@ -434,9 +446,11 @@ async def _clear_stale_server_state():
         DENGJEN_GRPC_SERVER_PORT, \
         SERVER_LOG_HANDLE, \
         CHANNEL, \
+        CHANNEL_PORT, \
         DENGJEN_GRPC_SERVICE
     process, GRPC_SERVER_PROCESS = GRPC_SERVER_PROCESS, None
     DENGJEN_GRPC_SERVER_PORT = None
+    CHANNEL_PORT = None
     DENGJEN_GRPC_SERVICE = None
     channel, CHANNEL = CHANNEL, None
     if channel is not None:

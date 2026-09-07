@@ -238,12 +238,14 @@ class TestClearStaleServerState:
                 closed.value = True
 
         monkeypatch.setattr(dengjen_grpc, "CHANNEL", _FakeChannel())
+        monkeypatch.setattr(dengjen_grpc, "CHANNEL_PORT", 50051)
         monkeypatch.setattr(dengjen_grpc, "DENGJEN_GRPC_SERVICE", object())
 
         asyncio.run(dengjen_grpc._clear_stale_server_state())
 
         assert closed.value
         assert dengjen_grpc.CHANNEL is None
+        assert dengjen_grpc.CHANNEL_PORT is None
         assert dengjen_grpc.DENGJEN_GRPC_SERVICE is None
 
     def test_a_channel_that_fails_to_close_does_not_stop_the_rest_of_the_cleanup(
@@ -877,3 +879,98 @@ class TestTerminateBoundedWait:
 
         assert not hasattr(globalVars, "DENGJEN_GRPC_SERVER_PORT")
         assert not hasattr(globalVars, "GRPC_SERVER_PROCESS")
+
+
+class _FakeAioChannelForInitialize:
+    def __init__(self):
+        self._loop = None
+        self.close_awaited = False
+        self.target = None
+
+    async def close(self):
+        self.close_awaited = True
+
+
+class TestInitializeChannelPortStaleness:
+    """initialize()'s channel-reuse check used to look only at whether the
+    aio loop matched, never at whether the port the channel was opened
+    against was still the one start_grpc_server() just confirmed. #150
+    made ports OS-assigned (a fresh spawn gets a different one each
+    time), and _saved_server_is_alive()/start_grpc_server() can spawn a
+    genuine replacement for a helper that died independently without
+    start_grpc_server() itself touching CHANNEL -- so a stale channel
+    could be kept pointed at a port nothing is listening on anymore.
+    CHANNEL_PORT closes that gap."""
+
+    @staticmethod
+    def _run_initialize_with(monkeypatch, *, channel, channel_port, new_port):
+        import asyncio
+
+        created_channels = []
+
+        def _create_channel(target):
+            channel = _FakeAioChannelForInitialize()
+            channel.target = target
+            created_channels.append(channel)
+            return channel
+
+        async def _fake_run_in_executor(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        async def _run():
+            loop = asyncio.get_running_loop()
+            channel._loop = loop
+            monkeypatch.setattr(dengjen_grpc, "CHANNEL", channel)
+            monkeypatch.setattr(dengjen_grpc, "CHANNEL_PORT", channel_port)
+            monkeypatch.setattr(dengjen_grpc, "DENGJEN_GRPC_SERVICE", "old-stub")
+            # The confirmed port of the helper start_grpc_server() decided
+            # to run with -- the same one whether it reused a live saved
+            # process or just spawned a replacement.
+            monkeypatch.setattr(dengjen_grpc, "DENGJEN_GRPC_SERVER_PORT", new_port)
+            monkeypatch.setattr(dengjen_grpc, "start_grpc_server", lambda: True)
+            monkeypatch.setattr(dengjen_grpc, "_reap_if_needed", lambda exe: None)
+            monkeypatch.setattr(
+                dengjen_grpc.aio, "run_in_executor", _fake_run_in_executor
+            )
+            monkeypatch.setattr(dengjen_grpc.aio.ENGINE, "event_loop", loop)
+            monkeypatch.setattr(
+                dengjen_grpc.grpc.aio, "insecure_channel", _create_channel
+            )
+            monkeypatch.setattr(
+                dengjen_grpc, "DengjenGrpcStub", lambda channel: f"stub-for-{channel}"
+            )
+
+            await dengjen_grpc.initialize()
+
+        asyncio.run(_run())
+        return created_channels
+
+    def test_rebuilds_the_channel_when_the_replacement_helper_gets_a_new_port(
+        self, monkeypatch
+    ):
+        old_channel = _FakeAioChannelForInitialize()
+
+        created_channels = self._run_initialize_with(
+            monkeypatch, channel=old_channel, channel_port=50051, new_port=50052
+        )
+
+        assert old_channel.close_awaited
+        assert len(created_channels) == 1
+        assert created_channels[0].target == "localhost:50052"
+        assert dengjen_grpc.CHANNEL is created_channels[0]
+        assert dengjen_grpc.CHANNEL_PORT == 50052
+        assert dengjen_grpc.DENGJEN_GRPC_SERVICE is not None
+        assert dengjen_grpc.DENGJEN_GRPC_SERVICE != "old-stub"
+
+    def test_reuses_the_channel_when_the_port_is_unchanged(self, monkeypatch):
+        channel = _FakeAioChannelForInitialize()
+
+        created_channels = self._run_initialize_with(
+            monkeypatch, channel=channel, channel_port=50051, new_port=50051
+        )
+
+        assert created_channels == []
+        assert not channel.close_awaited
+        assert dengjen_grpc.CHANNEL is channel
+        assert dengjen_grpc.CHANNEL_PORT == 50051
+        assert dengjen_grpc.DENGJEN_GRPC_SERVICE == "old-stub"
