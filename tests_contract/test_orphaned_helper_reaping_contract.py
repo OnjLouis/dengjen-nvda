@@ -136,33 +136,6 @@ class TestOrphanedHelperReaping:
         dengjen_grpc.GRPC_SERVER_PROCESS = None
         dengjen_grpc.DENGJEN_GRPC_SERVER_PORT = None
 
-        # CLAUDENOTE: diagnostic probe for the initial reap failure on CI
-        # (pid was still alive after initialize() returned) -- prints what
-        # the real matcher sees before initialize() gets a chance to run
-        # the same scan. Strip once the root cause is confirmed fixed.
-        import psutil as _real_psutil
-
-        grpc_server_exe = os.path.join(
-            dengjen_grpc.BIN_DIRECTORY, "dengjen-tts-grpc.exe"
-        )
-        candidates = list(_real_psutil.process_iter(attrs=["pid", "name", "exe"]))
-        print(f"[diag] our pid={os.getpid()} target exe={grpc_server_exe}")
-        for proc in candidates:
-            try:
-                if "dengjen-tts-grpc" not in (proc.name() or "").lower():
-                    continue
-                parent = proc.parent()
-                print(
-                    f"[diag] candidate pid={proc.pid} name={proc.name()} "
-                    f"exe={proc.exe()} parent={getattr(parent, 'pid', None)} "
-                    f"matches_exe={dengjen_grpc._matches_grpc_exe(proc, grpc_server_exe)} "
-                    f"owned={dengjen_grpc._owned_by_this_process(proc)}"
-                )
-            except Exception as exc:
-                print(f"[diag] candidate pid={proc.pid} inspection failed: {exc!r}")
-        found = dengjen_grpc._find_stale_grpc_helpers(_real_psutil, grpc_server_exe)
-        print(f"[diag] _find_stale_grpc_helpers returned: {[p.pid for p in found]}")
-
         second = dengjen_grpc.DengjenGrpcBackend()
         second.initialize()
 
